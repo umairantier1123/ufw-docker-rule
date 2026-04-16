@@ -14,7 +14,7 @@ import logging
 import re
 import fcntl
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 import glob
 import shutil
 
@@ -53,7 +53,7 @@ def set_verbosity(verbose):
 def record_transaction(action, port_proto, source, status, error=None):
     try:
         record = {
-            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             "action": action,
             "rule": f"{port_proto} from {source}",
             "status": status,
@@ -310,17 +310,66 @@ def migrate_from_ufw(dry_run=False):
     if migrated > 0 and not dry_run: execute_sync()
 
 def doctor(repair=False):
-    errors = 0
-    res = run_cmd(['iptables', '-S', 'DOCKER-USER'], check=False)
-    if res.returncode != 0 or "DOCKER-UFW-PORTS" not in res.stdout: errors += 1
-    if errors > 0 and repair:
-        time.sleep(1)
-        execute_sync()
+    logger.info("Executing deep diagnostic validation...")
+    errors, attempts = 0, 0
+
+    while True:
+        attempts += 1
+        loop_errors = 0
+        
+        daemon_path = "/etc/docker/daemon.json"
+        if os.path.exists(daemon_path):
+            try:
+                if json.load(open(daemon_path, 'r')).get("iptables") is False:
+                    logger.error("[FAIL] Daemon disabled iptables configuration.")
+                    loop_errors += 1
+            except Exception: pass
+            
+        res = run_cmd(['iptables', '-S', 'DOCKER-USER'], check=False)
+        if res.returncode != 0:
+            logger.error("[FAIL] DOCKER-USER enforcement boundary absent/lost.")
+            loop_errors += 1
+        elif "DOCKER-UFW-PORTS" not in res.stdout:
+            logger.error("[FAIL] DOCKER-UFW-PORTS missing from DOCKER-USER.")
+            loop_errors += 1
+            
+        # Check UFW interference bindings
+        ufw_res = run_cmd(['ufw', 'status'], check=False)
+        if ufw_res.returncode == 0:
+            found_ufw = False
+            for line in ufw_res.stdout.split('\n'):
+                if 'ALLOW' in line and '(v6)' not in line and not line.startswith('22'):
+                    logger.warning(f"[WARNING] UFW natively allows port: {line.strip()}. However Docker bypasses UFW entirely!")
+                    found_ufw = True
+            if found_ufw:
+                logger.warning("Consider migrating: ufw-docker-protect migrate-from-ufw")
+            
+        errors = loop_errors
+        
+        if errors > 0 and repair:
+            if attempts > 3:
+                logger.error("[CRITICAL] Healing engine failed multiple permutations.")
+                sys.exit(1)
+            logger.info("Repairing chains natively...")
+            time.sleep(1)
+            execute_sync()
+        else:
+            break
+            
+    if errors == 0: logger.info("[OK] Core mapping fully verified.")
+    else: logger.error("[WARNING] Structural gaps detected. Please run: --repair")
 
 def verify_rule(port_str):
     port, proto, source = parse_and_validate(port_str, "0.0.0.0/0")
-    if proto == 'udp': return
+    if proto == 'udp':
+        logger.info(f"UDP port {port} verification requires active datagram context (SKIP).")
+        return
+    logger.info(f"Verifying standard loopback NAT routing on {port}/{proto}...")
     res = run_cmd(['nc', '-z', '-w', '1', '127.0.0.1', str(port)], check=False)
+    if res.returncode == 0:
+        logger.info(f"[PASS] Loopback maps and routes securely on port {port}.")
+    else:
+        logger.error(f"[FAIL] Localhost connection failed tracking port {port}.")
 
 def list_rules(format_type):
     rules = load_config().get('rules', [])
