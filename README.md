@@ -20,12 +20,16 @@ We use `ufw` within this tool purely to maintain **visibility** and **logging** 
 
 ## Setup Instructions
 
+Clone the repository and install the daemon globally:
 ```bash
-# Execute the install script
+git clone <repository_url> ufw-container-protect
+cd ufw-container-protect
+
+# Execute the install script heavily configuring atomic buffers
 sudo bash install.sh
 
 # Validate the daemon and configuration health
-sudo ufw-docker-protect doctor
+sudo ufw-docker-protect doctor --repair
 ```
 
 ## Command Usage
@@ -37,6 +41,13 @@ sudo ufw-docker-protect allow-port 443/tcp 0.0.0.0/0
 # Allow specific IP access to an Admin portal on Port 22
 sudo ufw-docker-protect allow-port 22/tcp 10.0.5.21/32
 
+# Verify internally mapping if a port properly connects via container bindings loops!
+sudo ufw-docker-protect verify 443/tcp
+
+# Trigger dry-run preview evaluating inputs instead of updating the live stack
+sudo ufw-docker-protect allow-port 5432/tcp --dry-run
+```
+
 # Verify what rules are active globally
 sudo ufw-docker-protect list-rules
 
@@ -44,7 +55,9 @@ sudo ufw-docker-protect list-rules
 sudo ufw-docker-protect revoke-port 443/tcp 0.0.0.0/0
 ```
 
-## System Limitations & Safety
-- **IPv6 Supported**: `ufw-docker-protect` seamlessly replicates logic into `ip6tables` automatically if detected. 
+## System Limitations & Safety Guarantees
+- **Atomic Operations Context**: The pipeline evaluates chains purely in physical memory and injects them instantly using `< iptables-restore`. Partial failure corruption is mathematically impossible.
+- **Rollback Resilience**: Snapshots rotate flawlessly up to 5 cycles. You can invoke `sudo ufw-docker-protect rollback` if disaster strikes.
+- **Systemd Daemon State**: Bound statically natively to execution paths matching your local Docker socket meaning instances spin and seal correctly unconditionally across OS patching cycles natively parsing `/etc/ufw-docker-protect/ports.json`.
+- **IPv6 Supported**: `ufw-docker-protect` seamlessly replicates logic into `ip6tables` automatically if detected mapping rules perfectly. 
 - **Daemon Independence**: This does not alter existing `docker-compose.yaml` or `docker run` definitions.
-- **Docker Requirement**: The Docker engine must have `iptables: true` active (which is default). If you disable Docker's native iptables manipulation completely, this script is disabled safely.
