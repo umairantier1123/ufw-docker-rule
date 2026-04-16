@@ -27,9 +27,12 @@ fi
 cp ufw-docker-protect.service /etc/systemd/system/ufw-docker-protect.service
 systemctl daemon-reload
 
-# 4. Trigger Installation Sync
+# 4. Initialize Configurations
+echo "Initializing structural configurations..."
+
+# 5. Trigger Installation Sync
 /usr/local/bin/ufw-docker-protect install
 
 echo "Installation complete."
 echo "Run 'ufw-docker-protect doctor' to check system health."
-echo "Run 'ufw-docker-protect list-rules' to view current allows."
+echo "Run 'ufw-docker-protect' directly for the Interactive TUI Console."

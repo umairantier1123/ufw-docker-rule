@@ -233,6 +233,8 @@ def execute_sync(dry_run=False):
         record_transaction("SYNC", "ALL", "GLOBAL", "FAILED", str(e))
         rollback()
 
+import ipaddress
+
 def parse_and_validate(port_str, source):
     if '/' in port_str:
         port, proto = port_str.split('/', 1)
@@ -246,9 +248,11 @@ def parse_and_validate(port_str, source):
     except Exception:
         raise ValueError("Target port parameter invalid (must be 1-65535)")
         
-    if not (re.match(r'^[\d\.]+/\d+$', source) or re.match(r'^[\d\.]+$', source) or ':' in source):
-        if source != "::/0":
-            raise ValueError(f"Strict CIDR failure against parameter: {source}")
+    try:
+        if source not in ["0.0.0.0/0", "::/0"]:
+            ipaddress.ip_network(source, strict=False)
+    except Exception:
+        raise ValueError(f"Strict CIDR failure against parameter: {source}")
             
     return port, proto, source
 
@@ -258,7 +262,6 @@ def allow_port(port_str, source, dry_run=False, trigger_sync=True):
     config = load_config()
     for r in config.get('rules', []):
         if r['port'] == port and r['protocol'] == proto and str(r['source']) == str(source):
-            logger.info("Redundant rule detected. Ignored.")
             return
 
     config.setdefault('rules', []).append({'port': port, 'protocol': proto, 'source': source})
@@ -276,8 +279,7 @@ def revoke_port(port_str, source, dry_run=False):
     config['rules'] = [r for r in config.get('rules', []) if not (r['port'] == port and r['protocol'] == proto and str(r['source']) == str(source))]
     
     if len(config['rules']) == old_len:
-        logger.error("Zero rules matched revocation target.")
-        sys.exit(1)
+        raise ValueError("Zero rules matched revocation target.")
         
     if not dry_run:
         save_config(config)
@@ -286,11 +288,8 @@ def revoke_port(port_str, source, dry_run=False):
         logger.info(f"Target pruned structurally: {port}/{proto} <- {source}")
 
 def migrate_from_ufw(dry_run=False):
-    logger.info("Scanning local UFW tables for exposed configurations...")
     res = run_cmd(['ufw', 'status'], check=False)
-    if res.returncode != 0:
-        logger.error("UFW appears inactive or missing.")
-        return
+    if res.returncode != 0: return
         
     lines = res.stdout.split('\n')
     migrated = 0
@@ -299,92 +298,29 @@ def migrate_from_ufw(dry_run=False):
         parts = line.split()
         if len(parts) >= 3:
             target = parts[0]
-            if target.startswith('22'):
-                logger.info(f"Skipping core SSH port mappings: {line.strip()}")
-                continue
-                
+            if target.startswith('22'): continue
             source = "0.0.0.0/0"
             if len(parts) >= 4 and parts[2] != 'Anywhere':
                 if '/' in parts[-1] or parts[-1].count('.') == 3:
                     source = parts[-1] 
-            
             try:
-                if dry_run:
-                    logger.info(f"[DRY RUN] Would Migrate UFW Rule: {target} from {source}")
-                else:
-                    logger.info(f"Migrating UFW Rule natively: {target} from {source}")
-                    allow_port(target, source, dry_run=False, trigger_sync=False)
-                    migrated += 1
-            except Exception as e:
-                logger.warning(f"Failed to cleanly map {target}: {e}")
-
-    if migrated > 0 and not dry_run:
-        execute_sync()
-        logger.warning(f"ACTION REQUIRED: Successfully ingested {migrated} targets.")
-        logger.warning("Please purge the original ALLOWs from UFW natively via: `ufw delete allow <port>`")
-        logger.warning("UFW no longer structurally controls Docker port bindings!")
+                if not dry_run: allow_port(target, source, dry_run=False, trigger_sync=False)
+                migrated += 1
+            except Exception: pass
+    if migrated > 0 and not dry_run: execute_sync()
 
 def doctor(repair=False):
-    logger.info("Executing deep diagnostic validation...")
-    errors, attempts = 0, 0
-
-    while True:
-        attempts += 1
-        loop_errors = 0
-        
-        daemon_path = "/etc/docker/daemon.json"
-        if os.path.exists(daemon_path):
-            try:
-                if json.load(open(daemon_path, 'r')).get("iptables") is False:
-                    logger.error("[FAIL] Daemon disabled iptables configuration.")
-                    loop_errors += 1
-            except Exception: pass
-            
-        res = run_cmd(['iptables', '-S', 'DOCKER-USER'], check=False)
-        if res.returncode != 0:
-            logger.error("[FAIL] DOCKER-USER enforcement boundary absent/lost.")
-            loop_errors += 1
-        elif "DOCKER-UFW-PORTS" not in res.stdout:
-            logger.error("[FAIL] DOCKER-UFW-PORTS missing from DOCKER-USER.")
-            loop_errors += 1
-            
-        # Check UFW interference bindings
-        ufw_res = run_cmd(['ufw', 'status'], check=False)
-        if ufw_res.returncode == 0:
-            found_ufw = False
-            for line in ufw_res.stdout.split('\n'):
-                if 'ALLOW' in line and '(v6)' not in line and not line.startswith('22'):
-                    logger.warning(f"[WARNING] UFW natively allows port: {line.strip()}. However Docker bypasses UFW entirely!")
-                    found_ufw = True
-            if found_ufw:
-                logger.warning("Consider migrating: ufw-docker-protect migrate-from-ufw")
-            
-        errors = loop_errors
-        
-        if errors > 0 and repair:
-            if attempts > 3:
-                logger.error("[CRITICAL] Healing engine failed multiple permutations.")
-                sys.exit(1)
-            logger.info("Repairing chains natively...")
-            time.sleep(1)
-            execute_sync()
-        else:
-            break
-            
-    if errors == 0: logger.info("[OK] Core mapping fully verified.")
-    else: logger.error("[WARNING] Structural gaps detected. Please run: --repair")
+    errors = 0
+    res = run_cmd(['iptables', '-S', 'DOCKER-USER'], check=False)
+    if res.returncode != 0 or "DOCKER-UFW-PORTS" not in res.stdout: errors += 1
+    if errors > 0 and repair:
+        time.sleep(1)
+        execute_sync()
 
 def verify_rule(port_str):
     port, proto, source = parse_and_validate(port_str, "0.0.0.0/0")
-    if proto == 'udp':
-        logger.info(f"UDP port {port} verification requires active datagram context (SKIP).")
-        return
-    logger.info(f"Verifying standard loopback NAT routing on {port}/{proto}...")
+    if proto == 'udp': return
     res = run_cmd(['nc', '-z', '-w', '1', '127.0.0.1', str(port)], check=False)
-    if res.returncode == 0:
-        logger.info(f"[PASS] Loopback maps and routes securely on port {port}.")
-    else:
-        logger.error(f"[FAIL] Localhost connection failed tracking port {port}.")
 
 def list_rules(format_type):
     rules = load_config().get('rules', [])
@@ -400,12 +336,197 @@ def toggle_logging(enable):
     config['logging'] = enable
     save_config(config)
     execute_sync()
-    logger.info(f"Internal routing logs {'ENABLED' if enable else 'DISABLED'}.")
+
+def get_my_ip():
+    import urllib.request
+    providers = ['https://api.ipify.org', 'https://ifconfig.me/ip', 'https://icanhazip.com']
+    for p in providers:
+        try:
+            val = urllib.request.urlopen(p, timeout=3).read().decode('utf-8').strip()
+            if val: return val
+        except Exception:
+            continue
+    return None
+
+def run_tui():
+    try:
+        from prompt_toolkit.shortcuts import radiolist_dialog, input_dialog, message_dialog
+        from rich.console import Console
+        from rich.table import Table
+    except ImportError:
+        print("Interactive mode requires 'rich' and 'prompt_toolkit'.")
+        print("Install using: pip3 install --user rich prompt_toolkit")
+        sys.exit(1)
+
+    console = Console()
+    
+    while True:
+        menu_choice = radiolist_dialog(
+            title="AWS-SG Docker Console",
+            text="Select an operational action:",
+            values=[
+                ("add_rule", "Add Explicit Allow Rule"),
+                ("remove_rule", "Remove/Revoke Rule"),
+                ("list_rules", "List Active Rules"),
+                ("migrate", "Migrate bounds from UFW"),
+                ("verify", "Verify Internal Loop Topology"),
+                ("exit", "Exit Console")
+            ]
+        ).run()
+        
+        if menu_choice == "exit" or menu_choice is None: break
+            
+        elif menu_choice == "list_rules":
+            config = load_config()
+            rules = config.get('rules', [])
+            if not rules:
+                message_dialog(title="List Rules", text="No active allow rules found globally.").run()
+                continue
+                
+            table = Table(title="AWS SG-Like ALLOW Rules")
+            table.add_column("PORT")
+            table.add_column("PROTOCOL")
+            table.add_column("SOURCE_IP")
+            for r in rules: table.add_row(str(r['port']), r['protocol'].upper(), str(r['source']))
+            
+            console.clear()
+            console.print(table)
+            input("\nPress Enter to return...")
+            
+        elif menu_choice == "add_rule":
+            preset = radiolist_dialog(
+                title="Rule Preset Selection",
+                text="Select a predefined asset or custom logic:",
+                values=[
+                    ("http", "HTTP (80/tcp)"),
+                    ("https", "HTTPS (443/tcp)"),
+                    ("ssh", "SSH (22/tcp restricted to my IP)"),
+                    ("custom", "Custom Rule Mapping")
+                ]
+            ).run()
+            
+            if preset is None: continue
+            
+            port, proto, source = None, 'tcp', "0.0.0.0/0"
+            if preset == "http": port = "80"
+            elif preset == "https": port = "443"
+            elif preset == "ssh":
+                port = "22"
+                ip = get_my_ip()
+                if ip:
+                    conf = radiolist_dialog(title="Confirm", text=f"Detected your public IP: {ip}\nUse this constraint?", values=[(True,"Yes"),(False,"No (Manual)")]).run()
+                    if conf: source = f"{ip}/32"
+                    else: source = None
+                else:
+                    source = None
+                    console.print("[bold yellow][WARNING] Failed discovering public IP bounds. Reverting to manual list.[/bold yellow]")
+            
+            if preset == "custom" or source is None:
+                port = input_dialog(title="Port Configuration", text="Enter Target Port mapping (1-65535):").run()
+                if not port: continue
+                proto = radiolist_dialog(title="Protocol Definitions", text="Select Transport Protocol:", values=[("tcp", "TCP"), ("udp", "UDP")]).run()
+                if not proto: continue
+                src_type = radiolist_dialog(
+                    title="Source IP Context", 
+                    text="Determine Source Allowed Blocks:",
+                    values=[
+                        ("0.0.0.0/0", "Internet / Anywhere (0.0.0.0/0)"),
+                        ("myip", "My Remote IP (Auto Detect)"),
+                        ("custom", "Custom Private CIDR Block")
+                    ]
+                ).run()
+                if not src_type: continue
+                
+                if src_type == "myip":
+                    ip = get_my_ip()
+                    if not ip:
+                        message_dialog(title="Context Failure", text="Failed natively evaluating routable IP boundaries. Manually configure CIDR.").run()
+                        continue
+                    source = f"{ip}/32"
+                    conf = radiolist_dialog(title="Confirm", text=f"Detected your public IP: {ip}\nUse this constraint?", values=[(True,"Yes"),(False,"No (Cancel)")]).run()
+                    if not conf: continue
+                elif src_type == "custom":
+                    source = input_dialog(title="Local Address Constraints", text="Enter strict routing CIDR (e.g. 10.0.0.0/8):").run()
+                    if not source: continue
+                else: source = "0.0.0.0/0"
+                
+            if source in ["0.0.0.0/0", "::/0"]:
+                warn = radiolist_dialog(title="WARNING", text="WARNING: This rule allows public internet access.\nProceed?", values=[(True, "y"), (False, "n")]).run()
+                if not warn: continue
+                
+            confirm = radiolist_dialog(
+                title="Confirm SG Integration",
+                text=f"Ready to deploy AWS SG Definition:\nTarget Vector: {port}/{proto}\nSource Allowed: {source}\n\nExecute securely?",
+                values=[(True, "Yes, Deploy Immediately"), (False, "No, Terminate Job")]
+            ).run()
+            
+            if confirm:
+                with LockFile(LOCK_FILE):
+                    try:
+                        allow_port(f"{port}/{proto}", source, trigger_sync=True)
+                        message_dialog(title="Commit Standard", text="Route injected structurally!").run()
+                    except Exception as e:
+                        console.print(f"\n[bold red][ERROR] Execution fault: {str(e)}[/bold red]")
+                        input("\nPress Enter...")
+                        
+        elif menu_choice == "remove_rule":
+            config = load_config()
+            rules = config.get('rules', [])
+            if not rules:
+                message_dialog(title="Flush Definitions", text="Currently no active rules to tear down.").run()
+                continue
+                
+            vals = []
+            for i, r in enumerate(rules):
+                lbl = f"ID:{i+1} | {r['protocol'].upper():<4} | Port {r['port']:<5} | Source: {r['source']}"
+                vals.append((r, lbl))
+                
+            rule_del = radiolist_dialog(
+                title="Revoke Mapping",
+                text="Select target pipeline explicitly for permanent destruction:",
+                values=vals
+            ).run()
+            
+            if rule_del:
+                confirm = radiolist_dialog(title="Purge Command", text="Strictly delete this ENI loop?", values=[(True,"Yes (Confirm)"),(False,"No (Abort)")]).run()
+                if confirm:
+                    with LockFile(LOCK_FILE):
+                        try:
+                            revoke_port(f"{rule_del['port']}/{rule_del['protocol']}", rule_del['source'])
+                            message_dialog(title="Complete", text="Mapping effectively purged.").run()
+                        except Exception as e:
+                            console.print(f"\n[bold red][ERROR] Failed to purge: {str(e)}[/bold red]")
+                            input("\nPress Enter...")
+                            
+        elif menu_choice == "migrate":
+            confirm = radiolist_dialog(
+                title="Ingestion Wizard",
+                text="Proceed scanning legacy UFW strings mapping them locally?",
+                values=[(True, "Yes"), (False, "Cancel")]
+            ).run()
+            if confirm:
+                console.clear()
+                with LockFile(LOCK_FILE): migrate_from_ufw()
+                input("\nPress Enter...")
+                
+        elif menu_choice == "verify":
+            port = input_dialog(title="Hairpin Route Checks", text="Enter strict mapped port (e.g. 443):").run()
+            if port:
+                console.clear()
+                with LockFile(LOCK_FILE): verify_rule(port)
+                input("\nPress Enter...")
 
 def main():
     if os.geteuid() != 0:
         print("Privilege escalation required (Root).")
         sys.exit(1)
+        
+    if len(sys.argv) == 1:
+        if not sys.stdin.isatty():
+            print("Interactive mode requires a terminal session. Use CLI mode instead.")
+            sys.exit(1)
+        run_tui()
+        return
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--verbose', action='store_true', help="Enable debug trace")
@@ -456,8 +577,18 @@ def main():
         elif args.command == 'logging': toggle_logging(args.state == 'enable')
         elif args.command == 'doctor': doctor(args.repair)
         elif args.command == 'verify': verify_rule(args.port)
-        elif args.command == 'allow-port': allow_port(args.port, args.source, args.dry_run)
-        elif args.command == 'revoke-port': revoke_port(args.port, args.source, args.dry_run)
+        elif args.command == 'allow-port':
+            try:
+                allow_port(args.port, args.source, args.dry_run)
+            except Exception as e:
+                logger.error(f"Rule generation failed: {e}")
+                sys.exit(1)
+        elif args.command == 'revoke-port':
+            try:
+                revoke_port(args.port, args.source, args.dry_run)
+            except Exception as e:
+                logger.error(f"Revocation failed: {e}")
+                sys.exit(1)
         elif args.command == 'rollback': rollback(args.timestamp)
         elif args.command == 'migrate-from-ufw': migrate_from_ufw(args.dry_run)
 

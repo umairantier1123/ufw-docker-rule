@@ -39,7 +39,10 @@ sudo ufw-docker-protect doctor --repair
 ## Command Usage
 
 ```bash
-# Allow generic internet access to Port 443 TCP
+# Launch the Interactive TUI Console (AWS SG Configurator)
+sudo ufw-docker-protect
+
+# CLI Mode: Allow generic internet access to Port 443 TCP
 sudo ufw-docker-protect allow-port 443/tcp 0.0.0.0/0
 
 # Allow specific IP access to an Admin portal on Port 22
