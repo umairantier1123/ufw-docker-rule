@@ -201,7 +201,8 @@ def build_atomic_ruleset(iptables_cmd, config_rules, enable_logging):
         if not is_v6 and is_ipv6_rule: continue
         
         actual_source = '::/0' if (is_v6 and source == '0.0.0.0/0') else source
-        buf.append(f"-A DOCKER-UFW-PORTS -p {proto} --dport {port} -s {actual_source} -j ACCEPT")
+        # Crucial fix: FORWARD drops must evaluate original destination prior to NAT routing bypasses.
+        buf.append(f"-A DOCKER-UFW-PORTS -p {proto} -m conntrack --ctorigdstport {port} -s {actual_source} -j ACCEPT")
         
     buf.append("-A DOCKER-UFW-PORTS -j RETURN")
     buf.append("COMMIT\n")
