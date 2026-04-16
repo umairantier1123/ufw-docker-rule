@@ -1,0 +1,370 @@
+#!/usr/bin/env python3
+"""
+ufw-docker-protect
+An AWS Security Group-like enforcement layer for Docker.
+Protected via fcntl locks, IPv6 mirroring, and snapshot rollbacks.
+"""
+
+import sys
+import os
+import json
+import subprocess
+import argparse
+import logging
+import re
+import fcntl
+import time
+from datetime import datetime
+import glob
+
+LOG_DIR = '/var/log/ufw-docker-protect'
+LOG_FILE = os.path.join(LOG_DIR, 'activity.log')
+CONFIG_DIR = '/etc/ufw-docker-protect'
+CONFIG_PATH = os.path.join(CONFIG_DIR, 'ports.json')
+STATE_DIR = '/var/lib/ufw-docker-protect'
+SNAPSHOT_DIR = os.path.join(STATE_DIR, 'snapshots')
+LOCK_FILE = '/run/ufw-docker-protect.lock'
+
+os.makedirs(LOG_DIR, exist_ok=True)
+os.makedirs(CONFIG_DIR, exist_ok=True)
+os.makedirs(SNAPSHOT_DIR, exist_ok=True)
+
+# Console logger
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setLevel(logging.INFO)
+console_formatter = logging.Formatter('%(message)s')
+console_handler.setFormatter(console_formatter)
+
+logger = logging.getLogger('ufw-docker-protect')
+logger.setLevel(logging.INFO)
+logger.addHandler(console_handler)
+
+def record_transaction(action, port, source, status, error=None):
+    try:
+        record = {
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "action": action,
+            "port": port,
+            "source": source,
+            "status": status,
+            "error": str(error) if error else None
+        }
+        with open(LOG_FILE, 'a') as f:
+            f.write(json.dumps(record) + '\n')
+    except Exception as e:
+        logger.error(f"Failed to record transaction log: {e}")
+
+class LockFile:
+    def __init__(self, path):
+        self.path = path
+        self.fd = None
+
+    def __enter__(self):
+        self.fd = open(self.path, 'w')
+        try:
+            # Non-blocking lock execution
+            fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            logger.error(f"Locked by another process at {self.path}. Awaiting access...")
+            fcntl.flock(self.fd, fcntl.LOCK_EX) # Wait forever blocking
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.fd:
+            fcntl.flock(self.fd, fcntl.LOCK_UN)
+            self.fd.close()
+
+def run_cmd(cmd, check=True, silent=True):
+    if not silent:
+        logger.info(f"Running: {' '.join(cmd)}")
+    return subprocess.run(cmd, capture_output=True, text=True, check=check)
+
+def load_config():
+    if not os.path.exists(CONFIG_PATH):
+        save_config({'rules': [], 'logging': False})
+    with open(CONFIG_PATH, 'r') as f:
+        try:
+            return json.load(f)
+        except json.JSONDecodeError:
+            return {'rules': [], 'logging': False}
+
+def save_config(config):
+    with open(CONFIG_PATH, 'w') as f:
+        json.dump(config, f, indent=4)
+
+def check_ip6tables_available():
+    res = run_cmd(['ip6tables', '-L', '-n'], check=False)
+    return res.returncode == 0
+
+def check_docker_daemon():
+    daemon_path = "/etc/docker/daemon.json"
+    if os.path.exists(daemon_path):
+        with open(daemon_path, 'r') as f:
+            try:
+                data = json.load(f)
+                if data.get("iptables") is False:
+                    logger.error("CRITICAL: Docker iptables is disabled in daemon.json.")
+                    sys.exit(1)
+            except Exception:
+                pass
+
+def create_snapshot(tag="pre-sync"):
+    ts = int(time.time())
+    backup_path = os.path.join(SNAPSHOT_DIR, f"snapshot-{ts}-{tag}.rules")
+    try:
+        with open(backup_path, 'w') as f:
+            subprocess.run(['iptables-save'], stdout=f, check=True)
+        # Cleanup old snapshots
+        snaps = sorted(glob.glob(os.path.join(SNAPSHOT_DIR, "snapshot-*.rules")))
+        while len(snaps) > 5:
+            os.remove(snaps.pop(0))
+    except Exception as e:
+        logger.error(f"Snapshot creation failed: {e}")
+
+def rollback(target_ts=None):
+    snaps = sorted(glob.glob(os.path.join(SNAPSHOT_DIR, "snapshot-*.rules")), reverse=True)
+    if not snaps:
+        logger.error("No snapshots found.")
+        sys.exit(1)
+    
+    if target_ts:
+        file_target = None
+        for s in snaps:
+            if str(target_ts) in s:
+                file_target = s
+                break
+        if not file_target:
+            logger.error(f"Snapshot with timestamp {target_ts} not found.")
+            sys.exit(1)
+    else:
+        file_target = snaps[0]
+        
+    logger.info(f"Rolling back iptables state to snapshot: {os.path.basename(file_target)}")
+    try:
+        with open(file_target, 'r') as f:
+            subprocess.run(['iptables-restore'], stdin=f, check=True)
+        logger.info("Rollback successful.")
+    except Exception as e:
+        logger.error(f"Rollback failed critically: {e}")
+        sys.exit(1)
+
+def apply_rule(iptables_cmd, chain, args, action='insert'):
+    # Dedup Check first
+    exists = run_cmd([iptables_cmd, '-C', chain] + args, check=False).returncode == 0
+    if action == 'insert':
+        if exists: return
+        run_cmd([iptables_cmd, '-A', chain] + args)
+    elif action == 'delete':
+        while run_cmd([iptables_cmd, '-C', chain] + args, check=False).returncode == 0:
+            run_cmd([iptables_cmd, '-D', chain] + args, check=False)
+
+def flush_and_rebuild_chain(iptables_cmd, chain):
+    res = run_cmd([iptables_cmd, '-S', chain], check=False)
+    if res.returncode != 0:
+        run_cmd([iptables_cmd, '-N', chain])
+    run_cmd([iptables_cmd, '-F', chain])
+
+def sync_base_rules(iptables_cmd, has_logging_enabled=False):
+    res = run_cmd([iptables_cmd, '-S', 'DOCKER-USER'], check=False)
+    if res.returncode != 0:
+        run_cmd([iptables_cmd, '-N', 'DOCKER-USER'])
+    run_cmd([iptables_cmd, '-F', 'DOCKER-USER'])
+    flush_and_rebuild_chain(iptables_cmd, 'DOCKER-UFW-PORTS')
+
+    # Basic strict AWS SG ordered semantics
+    apply_rule(iptables_cmd, 'DOCKER-USER', ['-m', 'conntrack', '--ctstate', 'RELATED,ESTABLISHED', '-j', 'ACCEPT'])
+    loopback = '127.0.0.1/32' if iptables_cmd == 'iptables' else '::1/128'
+    apply_rule(iptables_cmd, 'DOCKER-USER', ['-s', loopback, '-j', 'ACCEPT'])
+    apply_rule(iptables_cmd, 'DOCKER-USER', ['-i', 'docker0', '-j', 'RETURN'])
+    apply_rule(iptables_cmd, 'DOCKER-USER', ['-i', 'br+', '-j', 'RETURN'])
+    apply_rule(iptables_cmd, 'DOCKER-USER', ['-j', 'DOCKER-UFW-PORTS'])
+    if has_logging_enabled:
+        apply_rule(iptables_cmd, 'DOCKER-USER', ['-j', 'LOG', '--log-prefix', 'DOCKER-BLOCK: '])
+    apply_rule(iptables_cmd, 'DOCKER-USER', ['-o', 'docker0', '-j', 'DROP'])
+    apply_rule(iptables_cmd, 'DOCKER-USER', ['-o', 'br+', '-j', 'DROP'])
+    apply_rule(iptables_cmd, 'DOCKER-USER', ['-j', 'RETURN'])
+
+def sync_allow_rules(iptables_cmd, config_rules):
+    for rule in config_rules:
+        port = rule['port']
+        proto = rule['protocol']
+        source = rule['source']
+        is_ipv6_rule = ':' in source
+        
+        if iptables_cmd == 'iptables' and is_ipv6_rule: continue
+        if iptables_cmd == 'ip6tables' and not is_ipv6_rule and source != '0.0.0.0/0': continue
+        
+        actual_source = '::/0' if (iptables_cmd == 'ip6tables' and source == '0.0.0.0/0') else source
+        apply_rule(iptables_cmd, 'DOCKER-UFW-PORTS', ['-p', proto, '--dport', str(port), '-s', actual_source, '-j', 'ACCEPT'])
+
+def execute_sync():
+    create_snapshot("sync")
+    check_docker_daemon()
+    config = load_config()
+    sync_base_rules('iptables', config.get('logging', False))
+    sync_allow_rules('iptables', config.get('rules', []))
+    if check_ip6tables_available():
+        sync_base_rules('ip6tables', config.get('logging', False))
+        sync_allow_rules('ip6tables', config.get('rules', []))
+
+def allow_port(port_str, source, dry_run=False):
+    port, proto, source = parse_and_validate(port_str, source)
+    if dry_run:
+        logger.info(f"[DRY-RUN] Would append allow rule: {port}/{proto} from {source}")
+        return
+    config = load_config()
+    rules = config.get('rules', [])
+    for r in rules:
+        if r['port'] == port and r['protocol'] == proto and str(r['source']) == str(source):
+            logger.info("Rule already exists.")
+            return
+
+    rules.append({'port': port, 'protocol': proto, 'source': source})
+    config['rules'] = rules
+    save_config(config)
+    try:
+        run_cmd(['ufw', 'allow', 'from', str(source), 'to', 'any', 'port', str(port), 'proto', proto], check=False)
+        execute_sync()
+        record_transaction("ALLOW", f"{port}/{proto}", source, "SUCCESS")
+        logger.info(f"Port {port}/{proto} explicit ALLOW successful.")
+    except Exception as e:
+        record_transaction("ALLOW", f"{port}/{proto}", source, "FAILED", str(e))
+        logger.error(f"Rule commit failed: {e}")
+        rollback()
+
+def parse_and_validate(port_str, source):
+    if '/' in port_str:
+        port, proto = port_str.split('/', 1)
+        if proto.lower() not in ['tcp', 'udp']: raise ValueError("Proto must be tcp or udp.")
+    else:
+        port, proto = port_str, 'tcp'
+    try:
+        port = int(port)
+        if port < 1 or port > 65535: raise ValueError()
+    except:
+        raise ValueError("Port sequence out of range (1-65535)")
+    if not (re.match(r'^[\d\.]+/\d+$', source) or re.match(r'^[\d\.]+$', source) or ':' in source):
+        if source != "::/0":
+            raise ValueError(f"Invalid CIDR mapping parameters for {source}")
+    return port, proto, source
+
+def revoke_port(port_str, source):
+    port, proto, source = parse_and_validate(port_str, source)
+    config = load_config()
+    rules = config.get('rules', [])
+    new_rules = [r for r in rules if not (str(r['port']) == str(port) and r['protocol'] == proto and str(r['source']) == str(source))]
+    if len(new_rules) == len(rules):
+        logger.error("No exact matching rule found.")
+        sys.exit(1)
+    
+    config['rules'] = new_rules
+    save_config(config)
+    run_cmd(['ufw', 'delete', 'allow', 'from', str(source), 'to', 'any', 'port', str(port), 'proto', proto], check=False)
+    execute_sync()
+    record_transaction("REVOKE", f"{port}/{proto}", source, "SUCCESS")
+    logger.info(f"Port {port}/{proto} from {source} revoked successfully.")
+
+def doctor(repair=False):
+    logger.info("Doctor Validation Initiated...")
+    errors = 0
+    if repair: logger.info("Repair flag active, enforcing sync...")
+    
+    daemon_path = "/etc/docker/daemon.json"
+    if os.path.exists(daemon_path):
+        try:
+            if json.load(open(daemon_path)).get("iptables") is False:
+                logger.error("[FAIL] Docker iptables is disabled.")
+                errors += 1
+        except Exception: pass
+
+    res = run_cmd(['iptables', '-S', 'DOCKER-USER'], check=False)
+    if res.returncode != 0:
+        logger.error("[FAIL] DOCKER-USER chain is entirely absent.")
+        errors += 1
+    else:
+        out = res.stdout
+        if "DROP" in out and "RELATED,ESTABLISHED" in out:
+            logger.info("[OK] Core rule definitions are loaded.")
+        else:
+            logger.error("[FAIL] DOCKER-USER structure appears corrupted.")
+            errors += 1
+
+    if repair and errors > 0:
+        logger.info("Repairing chains...")
+        execute_sync()
+        logger.info("State effectively restored. Verify with `list-rules`.")
+        return
+
+    if errors == 0:
+        logger.info("[OK] System Health validated against active constraints.")
+    else:
+        if not repair:
+             logger.error(f"[WARNING] Unhealthy configuration detected. Please execute: ufw-docker-protect doctor --repair")
+
+def list_rules(format_type):
+    config = load_config()
+    rules = config.get('rules', [])
+    if format_type == 'json':
+        print(json.dumps(rules, indent=2))
+        return
+    print("AWS SG-Like ALLOW Rules:")
+    print(f"{'PORT':<10} {'PROTOCOL':<10} {'SOURCE_IP':<20}")
+    print("-" * 42)
+    for r in rules:
+        print(f"{r['port']:<10} {r['protocol'].upper():<10} {r['source']:<20}")
+
+def main():
+    if os.geteuid() != 0:
+        print("Fatal: ufw-docker-protect must be run as root.")
+        sys.exit(1)
+
+    parser = argparse.ArgumentParser(description="AWS Security Group style protection CLI for Docker.")
+    subparsers = parser.add_subparsers(dest='command', required=True)
+    
+    subparsers.add_parser('install')
+    
+    sync_p = subparsers.add_parser('sync')
+    sync_p.add_argument('--dry-run', action='store_true')
+    
+    list_p = subparsers.add_parser('list-rules')
+    list_p.add_argument('--format', choices=['table', 'json'], default='table')
+    
+    doc_p = subparsers.add_parser('doctor')
+    doc_p.add_argument('--repair', action='store_true')
+    
+    allow_p = subparsers.add_parser('allow-port')
+    allow_p.add_argument('port')
+    allow_p.add_argument('source', nargs='?', default='0.0.0.0/0')
+    allow_p.add_argument('--dry-run', action='store_true')
+    
+    revoke_p = subparsers.add_parser('revoke-port')
+    revoke_p.add_argument('port')
+    revoke_p.add_argument('source', nargs='?', default='0.0.0.0/0')
+    
+    roll_p = subparsers.add_parser('rollback')
+    roll_p.add_argument('timestamp', nargs='?', default=None)
+
+    args = parser.parse_args()
+
+    # Wrap top-level actions in fcntl exclusivity lock
+    with LockFile(LOCK_FILE):
+        if args.command == 'install':
+            execute_sync()
+            run_cmd(['systemctl', 'enable', 'ufw-docker-protect.service'], check=False)
+            run_cmd(['systemctl', 'start', 'ufw-docker-protect.service'], check=False)
+        elif args.command == 'sync':
+            if args.dry_run: logger.info("Dry-run sync... Configuration parsable, exiting.")
+            else: execute_sync()
+        elif args.command == 'list-rules':
+            list_rules(args.format)
+        elif args.command == 'doctor':
+            doctor(args.repair)
+        elif args.command == 'allow-port':
+            allow_port(args.port, args.source, args.dry_run)
+        elif args.command == 'revoke-port':
+            revoke_port(args.port, args.source)
+        elif args.command == 'rollback':
+            rollback(args.timestamp)
+
+if __name__ == '__main__':
+    main()

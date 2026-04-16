@@ -1,0 +1,19 @@
+[Unit]
+Description=UFW Docker Protect AWS SG Layer
+After=docker.service ufw.service network.target
+Requires=docker.service
+PartOf=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=-/usr/local/bin/ufw-docker-protect doctor --repair
+ExecStart=/usr/local/bin/ufw-docker-protect sync
+ExecReload=/usr/local/bin/ufw-docker-protect sync
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ufw-docker-protect
+
+[Install]
+WantedBy=multi-user.target
