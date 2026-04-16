@@ -14,11 +14,12 @@ To solve this securely and efficiently, this tool manages the native `DOCKER-USE
 - **Outbound Open**: Containers remain fully capable of reaching external endpoints.
 - **Idempotent Allow Lists**: All exceptions must be explicitly registered via the `allow-port` command mapping ports to source IPs (or `0.0.0.0/0` catchall).
 
-### UFW's Role (Visibility)
-> **Note**: Do **NOT** rely on UFW to manage or block Docker ports. It structurally cannot do so while Docker's iptables engine runs.
-We use `ufw` within this tool purely to maintain **visibility** and **logging** of what ports are officially allowed so that `ufw status` cleanly reflects reality. The physical **enforcement** behaves entirely within `iptables` and the `DOCKER-USER` managed chain.
+### UFW's Role (Bypassed Completely)
+> **Note**: Do **NOT** rely on UFW to manage or block Docker ports. It structurally cannot do so natively while Docker's iptables engine runs.
+**UFW should only be utilized for Host connectivity (e.g., SSH Port 22)**.
+The physical enforcement block evaluates purely over `iptables` and defaults to terminating unapproved connections identically to an AWS Security Group denying traffic to untagged assets. UFW explicitly does NOT control docker exposure constraints!
 
-## Setup Instructions
+## Setup & Migration Instructions
 
 Clone the repository and install the daemon globally:
 ```bash
@@ -27,6 +28,9 @@ cd ufw-container-protect
 
 # Execute the install script heavily configuring atomic buffers
 sudo bash install.sh
+
+# Run the native migration tool ripping legacy UFW allowances natively into Docker configurations
+sudo ufw-docker-protect migrate-from-ufw
 
 # Validate the daemon and configuration health
 sudo ufw-docker-protect doctor --repair

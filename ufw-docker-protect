@@ -41,6 +41,7 @@ class StructuredLogger:
             
     def info(self, msg): self.logger.info(msg)
     def error(self, msg): self.logger.error(msg)
+    def warning(self, msg): self.logger.warning(msg)
     def debug(self, msg): self.logger.debug(msg)
 
 logger = StructuredLogger(False)
@@ -91,7 +92,7 @@ def get_disk_free(path):
     return free
 
 def create_snapshot(tag="pre"):
-    if get_disk_free(SNAPSHOT_DIR) < 10_000_000:  # 10MB sanity check
+    if get_disk_free(SNAPSHOT_DIR) < 10_000_000:  
         logger.error("Critically low disk space. Failing snapshot operation safely.")
         sys.exit(1)
         
@@ -168,7 +169,6 @@ def build_atomic_ruleset(iptables_cmd, config_rules, enable_logging):
     buf.append("-F DOCKER-USER")
     buf.append("-F DOCKER-UFW-PORTS")
     
-    # Base AWS SG Enforcements
     buf.append("-A DOCKER-USER -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT")
     
     loopback = '::1/128' if is_v6 else '127.0.0.1/32'
@@ -190,7 +190,6 @@ def build_atomic_ruleset(iptables_cmd, config_rules, enable_logging):
     buf.append("-A DOCKER-USER -o br+ -j DROP")
     buf.append("-A DOCKER-USER -j RETURN")
     
-    # Custom Rules injection
     for rule in config_rules:
         proto, port, source = rule['protocol'], rule['port'], rule['source']
         is_ipv6_rule = ':' in source
@@ -253,7 +252,7 @@ def parse_and_validate(port_str, source):
             
     return port, proto, source
 
-def allow_port(port_str, source, dry_run=False):
+def allow_port(port_str, source, dry_run=False, trigger_sync=True):
     port, proto, source = parse_and_validate(port_str, source)
     
     config = load_config()
@@ -266,10 +265,9 @@ def allow_port(port_str, source, dry_run=False):
     
     if not dry_run:
         save_config(config)
-        run_cmd(['ufw', 'allow', 'from', str(source), 'to', 'any', 'port', str(port), 'proto', proto], check=False, silent=True)
-        execute_sync()
+        if trigger_sync: execute_sync()
         record_transaction("ALLOW", f"{port}/{proto}", source, "SUCCESS")
-        logger.info(f"Deployed: Port {port}/{proto} <- {source}")
+        logger.info(f"Deployed strictly: Port {port}/{proto} <- {source}")
 
 def revoke_port(port_str, source, dry_run=False):
     port, proto, source = parse_and_validate(port_str, source)
@@ -283,10 +281,48 @@ def revoke_port(port_str, source, dry_run=False):
         
     if not dry_run:
         save_config(config)
-        run_cmd(['ufw', 'delete', 'allow', 'from', str(source), 'to', 'any', 'port', str(port), 'proto', proto], check=False, silent=True)
         execute_sync()
         record_transaction("REVOKE", f"{port}/{proto}", source, "SUCCESS")
         logger.info(f"Target pruned structurally: {port}/{proto} <- {source}")
+
+def migrate_from_ufw(dry_run=False):
+    logger.info("Scanning local UFW tables for exposed configurations...")
+    res = run_cmd(['ufw', 'status'], check=False)
+    if res.returncode != 0:
+        logger.error("UFW appears inactive or missing.")
+        return
+        
+    lines = res.stdout.split('\n')
+    migrated = 0
+    for line in lines:
+        if 'ALLOW' not in line or '(v6)' in line: continue
+        parts = line.split()
+        if len(parts) >= 3:
+            target = parts[0]
+            if target.startswith('22'):
+                logger.info(f"Skipping core SSH port mappings: {line.strip()}")
+                continue
+                
+            source = "0.0.0.0/0"
+            if len(parts) >= 4 and parts[2] != 'Anywhere':
+                if '/' in parts[-1] or parts[-1].count('.') == 3:
+                    source = parts[-1] 
+            
+            try:
+                if dry_run:
+                    logger.info(f"[DRY RUN] Would Migrate UFW Rule: {target} from {source}")
+                else:
+                    logger.info(f"Migrating UFW Rule natively: {target} from {source}")
+                    allow_port(target, source, dry_run=False, trigger_sync=False)
+                    migrated += 1
+            except Exception as e:
+                logger.warning(f"Failed to cleanly map {target}: {e}")
+
+    if migrated > 0 and not dry_run:
+        execute_sync()
+        logger.warning(f"ACTION REQUIRED: Successfully ingested {migrated} targets.")
+        logger.warning("Please purge the original ALLOWs from UFW natively via: `ufw delete allow <port>`")
+        logger.warning("UFW no longer structurally controls Docker port bindings!")
 
 def doctor(repair=False):
     logger.info("Executing deep diagnostic validation...")
@@ -312,6 +348,17 @@ def doctor(repair=False):
             logger.error("[FAIL] DOCKER-UFW-PORTS missing from DOCKER-USER.")
             loop_errors += 1
             
+        # Check UFW interference bindings
+        ufw_res = run_cmd(['ufw', 'status'], check=False)
+        if ufw_res.returncode == 0:
+            found_ufw = False
+            for line in ufw_res.stdout.split('\n'):
+                if 'ALLOW' in line and '(v6)' not in line and not line.startswith('22'):
+                    logger.warning(f"[WARNING] UFW natively allows port: {line.strip()}. However Docker bypasses UFW entirely!")
+                    found_ufw = True
+            if found_ufw:
+                logger.warning("Consider migrating: ufw-docker-protect migrate-from-ufw")
+            
         errors = loop_errors
         
         if errors > 0 and repair:
@@ -328,16 +375,14 @@ def doctor(repair=False):
     else: logger.error("[WARNING] Structural gaps detected. Please run: --repair")
 
 def verify_rule(port_str):
-    """Verifies if local connection works to mapped target."""
     port, proto, source = parse_and_validate(port_str, "0.0.0.0/0")
     if proto == 'udp':
-        logger.info(f"Verification of purely UDP {port} bounds requires external context bindings (SKIP).")
+        logger.info(f"UDP port {port} verification requires active datagram context (SKIP).")
         return
-        
     logger.info(f"Verifying standard loopback NAT routing on {port}/{proto}...")
     res = run_cmd(['nc', '-z', '-w', '1', '127.0.0.1', str(port)], check=False)
     if res.returncode == 0:
-        logger.info(f"[PASS] Loopback / Localhost internally maps and routes securely on port {port}.")
+        logger.info(f"[PASS] Loopback maps and routes securely on port {port}.")
     else:
         logger.error(f"[FAIL] Localhost connection failed tracking port {port}.")
 
@@ -383,6 +428,9 @@ def main():
     ver_p = subparsers.add_parser('verify')
     ver_p.add_argument('port')
     
+    mig_p = subparsers.add_parser('migrate-from-ufw')
+    mig_p.add_argument('--dry-run', action='store_true')
+    
     allow_p = subparsers.add_parser('allow-port')
     allow_p.add_argument('port')
     allow_p.add_argument('source', nargs='?', default='0.0.0.0/0')
@@ -411,6 +459,7 @@ def main():
         elif args.command == 'allow-port': allow_port(args.port, args.source, args.dry_run)
         elif args.command == 'revoke-port': revoke_port(args.port, args.source, args.dry_run)
         elif args.command == 'rollback': rollback(args.timestamp)
+        elif args.command == 'migrate-from-ufw': migrate_from_ufw(args.dry_run)
 
 if __name__ == '__main__':
     main()
