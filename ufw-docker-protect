@@ -159,8 +159,39 @@ def check_docker_daemon():
 def check_ip6tables_available():
     return run_cmd(['ip6tables', '-L', '-n'], check=False).returncode == 0
 
-def build_atomic_ruleset(iptables_cmd, config_rules, enable_logging):
+def get_docker_subnets():
+    """
+    Dynamically identifies all Docker bridge subnets.
+    Returns a tuple: (ipv4_subnets, ipv6_subnets)
+    """
+    v4, v6 = [], []
+    try:
+        res = run_cmd(['docker', 'network', 'inspect', '$(docker network ls -q)'], check=False)
+        if res.returncode == 0:
+            networks = json.loads(res.stdout)
+            for net in networks:
+                for config in net.get('IPAM', {}).get('Config', []):
+                    subnet = config.get('Subnet')
+                    if subnet:
+                        if ':' in subnet: v6.append(subnet)
+                        else: v4.append(subnet)
+    except Exception as e:
+        logger.warning(f"Failed to auto-detect Docker subnets via API: {e}")
+        
+    # Fallback: Scrape from ip addr if docker API fails or returns partial info
+    try:
+        res = run_cmd(['ip', '-4', 'addr', 'show'], check=False)
+        for line in res.stdout.split('\n'):
+            if 'br-' in line or 'docker0' in line:
+                m = re.search(r'inet ([\d\./]+)', line)
+                if m and m.group(1) not in v4: v4.append(m.group(1))
+    except Exception: pass
+    
+    return list(set(v4)), list(set(v6))
+
+def build_atomic_ruleset(iptables_cmd, config_rules, enable_logging, subnets):
     is_v6 = (iptables_cmd == 'ip6tables')
+    active_subnets = subnets[1] if is_v6 else subnets[0]
     
     buf = []
     buf.append("*filter")
@@ -169,28 +200,37 @@ def build_atomic_ruleset(iptables_cmd, config_rules, enable_logging):
     buf.append("-F DOCKER-USER")
     buf.append("-F DOCKER-UFW-PORTS")
     
+    # 1. Allow Established
     buf.append("-A DOCKER-USER -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT")
     
+    # 2. Local/Internal Freedom (High performance bypass)
     loopback = '::1/128' if is_v6 else '127.0.0.1/32'
     buf.append(f"-A DOCKER-USER -s {loopback} -j ACCEPT")
     buf.append(f"-A DOCKER-USER -d {loopback} -j ACCEPT")
     
-    buf.append("-A DOCKER-USER -i docker0 -j RETURN")
-    buf.append("-A DOCKER-USER -i docker_gwbridge -j RETURN")
-    buf.append("-A DOCKER-USER -i br-+ -j RETURN")
+    # Internal Interface Whitelist (Bridges are allowed to talk OUT)
+    for iface in ['docker0', 'docker_gwbridge', 'br+', 'veth+']:
+        buf.append(f"-A DOCKER-USER -i {iface} -j RETURN")
+        
+    # 3. Subnet-based Internal Freedom (Catch hidden interfaces)
+    for subnet in active_subnets:
+        buf.append(f"-A DOCKER-USER -s {subnet} -j RETURN")
     
-    buf.append("-A DOCKER-USER -o docker0 -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN")
-    buf.append("-A DOCKER-USER -o docker_gwbridge -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN")
-    buf.append("-A DOCKER-USER -o br-+ -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN")
-    
+    # 4. Filter External -> Internal via Allow-list
     buf.append("-A DOCKER-USER -j DOCKER-UFW-PORTS")
     
     if enable_logging:
         buf.append("-A DOCKER-USER -j LOG --log-prefix \"DOCKER-BLOCK: \"")
         
-    buf.append("-A DOCKER-USER -o docker0 -j DROP")
-    buf.append("-A DOCKER-USER -o docker_gwbridge -j DROP")
-    buf.append("-A DOCKER-USER -o br-+ -j DROP")
+    # 5. Default Deny (Defense in Depth)
+    # Block by interface patterns
+    for iface in ['docker0', 'docker_gwbridge', 'br+', 'veth+']:
+        buf.append(f"-A DOCKER-USER -o {iface} -j DROP")
+        
+    # Block by destination subnets (Ensures NO leaks even if iface names vary)
+    for subnet in active_subnets:
+        buf.append(f"-A DOCKER-USER -d {subnet} -j DROP")
+        
     buf.append("-A DOCKER-USER -j RETURN")
     
     for rule in config_rules:
@@ -210,8 +250,10 @@ def build_atomic_ruleset(iptables_cmd, config_rules, enable_logging):
 
 def execute_sync(dry_run=False):
     config = load_config()
-    v4_rules = build_atomic_ruleset('iptables', config.get('rules', []), config.get('logging', False))
-    v6_rules = build_atomic_ruleset('ip6tables', config.get('rules', []), config.get('logging', False)) if check_ip6tables_available() else None
+    subnets = get_docker_subnets()
+    
+    v4_rules = build_atomic_ruleset('iptables', config.get('rules', []), config.get('logging', False), subnets)
+    v6_rules = build_atomic_ruleset('ip6tables', config.get('rules', []), config.get('logging', False), subnets) if check_ip6tables_available() else None
 
     if dry_run:
         logger.info("[DRY RUN] Generated Built Rulesets:")
@@ -231,7 +273,7 @@ def execute_sync(dry_run=False):
             if proc6.returncode != 0: raise Exception("ip6tables-restore failed")
             
         record_transaction("SYNC", "ALL", "GLOBAL", "SUCCESS")
-        logger.info("Synchronization implemented atomically.")
+        logger.info("Synchronization implemented atomically with subnet isolation.")
     except Exception as e:
         logger.error(f"Rule injection failed: {e}")
         record_transaction("SYNC", "ALL", "GLOBAL", "FAILED", str(e))
