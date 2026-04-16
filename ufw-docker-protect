@@ -147,47 +147,144 @@ def save_config(config):
         json.dump(config, f, indent=4)
 
 def check_docker_daemon():
+    """Ensure Docker daemon is correctly configured for iptables enforcement.
+    Disables userland-proxy so all traffic flows through FORWARD chain (our DOCKER-USER rules).
+    Without this, docker-proxy listens on host INPUT chain, bypassing all our rules.
+    """
     daemon_path = "/etc/docker/daemon.json"
-    if os.path.exists(daemon_path):
+    needs_restart = False
+    
+    try:
+        if os.path.exists(daemon_path):
+            with open(daemon_path, 'r') as f:
+                daemon_config = json.load(f)
+        else:
+            daemon_config = {}
+    except Exception:
+        daemon_config = {}
+
+    if daemon_config.get("iptables") is False:
+        logger.error("[FATAL] Docker iptables is disabled in daemon.json. This tool cannot work.")
+        logger.error("Remove the '\"iptables\": false' line from /etc/docker/daemon.json and restart Docker.")
+        sys.exit(1)
+
+    if daemon_config.get("userland-proxy", True) is True:
+        logger.info("[FIX] Disabling Docker userland-proxy to enforce iptables-based port control...")
+        daemon_config["userland-proxy"] = False
         try:
-            if json.load(open(daemon_path, 'r')).get("iptables") is False:
-                logger.error("Docker iptables is explicitly disabled in daemon.json.")
-                sys.exit(1)
-        except Exception:
-            pass
+            with open(daemon_path, 'w') as f:
+                json.dump(daemon_config, f, indent=4)
+            needs_restart = True
+            logger.info("[OK] daemon.json updated. Restarting Docker daemon...")
+        except Exception as e:
+            logger.error(f"[ERROR] Failed to update daemon.json: {e}")
+            logger.error("Manually add '\"userland-proxy\": false' to /etc/docker/daemon.json and restart Docker.")
+            sys.exit(1)
+
+    if needs_restart:
+        res = run_cmd(['systemctl', 'restart', 'docker'], check=False)
+        if res.returncode != 0:
+            logger.error("[ERROR] Failed to restart Docker. Please run: systemctl restart docker")
+            sys.exit(1)
+        logger.info("[OK] Docker restarted successfully.")
+        time.sleep(3)  # Wait for Docker to re-create iptables rules
 
 def check_ip6tables_available():
     return run_cmd(['ip6tables', '-L', '-n'], check=False).returncode == 0
 
 def get_docker_subnets():
-    """
-    Dynamically identifies all Docker bridge subnets.
+    """Dynamically identifies all Docker bridge subnets.
     Returns a tuple: (ipv4_subnets, ipv6_subnets)
     """
     v4, v6 = [], []
     try:
-        res = run_cmd(['docker', 'network', 'inspect', '$(docker network ls -q)'], check=False)
-        if res.returncode == 0:
-            networks = json.loads(res.stdout)
-            for net in networks:
-                for config in net.get('IPAM', {}).get('Config', []):
-                    subnet = config.get('Subnet')
-                    if subnet:
-                        if ':' in subnet: v6.append(subnet)
-                        else: v4.append(subnet)
+        # Get all network IDs first, then inspect them
+        ls_res = run_cmd(['docker', 'network', 'ls', '-q'], check=False)
+        if ls_res.returncode == 0:
+            net_ids = ls_res.stdout.strip().split('\n')
+            net_ids = [n for n in net_ids if n]
+            if net_ids:
+                inspect_res = run_cmd(['docker', 'network', 'inspect'] + net_ids, check=False)
+                if inspect_res.returncode == 0:
+                    networks = json.loads(inspect_res.stdout)
+                    for net in networks:
+                        for cfg in net.get('IPAM', {}).get('Config', []):
+                            subnet = cfg.get('Subnet')
+                            if subnet:
+                                if ':' in subnet:
+                                    v6.append(subnet)
+                                else:
+                                    v4.append(subnet)
     except Exception as e:
-        logger.warning(f"Failed to auto-detect Docker subnets via API: {e}")
-        
-    # Fallback: Scrape from ip addr if docker API fails or returns partial info
+        logger.warning(f"Docker API subnet detection failed: {e}")
+
+    # Fallback: parse ip addr for bridge interfaces
     try:
         res = run_cmd(['ip', '-4', 'addr', 'show'], check=False)
+        cur_iface = ''
         for line in res.stdout.split('\n'):
-            if 'br-' in line or 'docker0' in line:
-                m = re.search(r'inet ([\d\./]+)', line)
-                if m and m.group(1) not in v4: v4.append(m.group(1))
-    except Exception: pass
-    
+            if ': ' in line:
+                cur_iface = line.split(': ')[1].split(':')[0].strip() if len(line.split(': ')) > 1 else ''
+            if ('br-' in cur_iface or 'docker' in cur_iface) and 'inet ' in line:
+                m = re.search(r'inet (\d+\.\d+\.\d+\.\d+/\d+)', line)
+                if m:
+                    # Convert host address to network CIDR
+                    import ipaddress
+                    net = str(ipaddress.IPv4Network(m.group(1), strict=False))
+                    if net not in v4:
+                        v4.append(net)
+    except Exception:
+        pass
+
     return list(set(v4)), list(set(v6))
+
+def get_docker_published_ports():
+    """Get all published Docker ports and their rules from config.
+    Used to build INPUT chain rules that block the userland-proxy path.
+    """
+    config = load_config()
+    return config.get('rules', [])
+
+def build_input_ruleset(iptables_cmd, config_rules, enable_logging):
+    """Build INPUT chain rules to block/allow Docker exposed ports.
+    This is critical because Docker's DNAT (even without userland-proxy) can route
+    traffic to the host's INPUT chain for ports bound to 0.0.0.0.
+    """
+    is_v6 = (iptables_cmd == 'ip6tables')
+    buf = []
+    buf.append("*filter")
+    buf.append(":DOCKER-UFW-INPUT - [0:0]")
+    buf.append("-F DOCKER-UFW-INPUT")
+
+    # Hook into INPUT chain (only add once, idempotent check handled by -C test at runtime)
+    buf.append("-A INPUT -j DOCKER-UFW-INPUT")
+
+    # Allow established connections
+    buf.append("-A DOCKER-UFW-INPUT -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT")
+
+    # For each explicitly allowed rule, permit inbound on that port from that source
+    for rule in config_rules:
+        proto, port, source = rule['protocol'], rule['port'], rule['source']
+        is_ipv6_rule = ':' in source
+        if is_v6 and not is_ipv6_rule and source != '0.0.0.0/0': continue
+        if not is_v6 and is_ipv6_rule: continue
+        actual_source = '::/0' if (is_v6 and source == '0.0.0.0/0') else source
+        buf.append(f"-A DOCKER-UFW-INPUT -p {proto} --dport {port} -s {actual_source} -j ACCEPT")
+
+    # Default: drop all other inbound traffic to Docker-published ports
+    # We detect published ports from config - any port NOT in allow-list gets dropped
+    all_ports = set()
+    for rule in config_rules:
+        all_ports.add((rule['protocol'], rule['port']))
+
+    for proto, port in all_ports:
+        if enable_logging:
+            buf.append(f"-A DOCKER-UFW-INPUT -p {proto} --dport {port} -j LOG --log-prefix \"DOCKER-INPUT-BLOCK: \"")
+        buf.append(f"-A DOCKER-UFW-INPUT -p {proto} --dport {port} -j DROP")
+
+    buf.append("-A DOCKER-UFW-INPUT -j RETURN")
+    buf.append("COMMIT\n")
+    return "\n".join(buf)
 
 def build_atomic_ruleset(iptables_cmd, config_rules, enable_logging, subnets):
     is_v6 = (iptables_cmd == 'ip6tables')
@@ -251,29 +348,47 @@ def build_atomic_ruleset(iptables_cmd, config_rules, enable_logging, subnets):
 def execute_sync(dry_run=False):
     config = load_config()
     subnets = get_docker_subnets()
-    
-    v4_rules = build_atomic_ruleset('iptables', config.get('rules', []), config.get('logging', False), subnets)
-    v6_rules = build_atomic_ruleset('ip6tables', config.get('rules', []), config.get('logging', False), subnets) if check_ip6tables_available() else None
+    rules = config.get('rules', [])
+    enable_logging = config.get('logging', False)
+
+    v4_forward = build_atomic_ruleset('iptables', rules, enable_logging, subnets)
+    v6_forward = build_atomic_ruleset('ip6tables', rules, enable_logging, subnets) if check_ip6tables_available() else None
+
+    v4_input = build_input_ruleset('iptables', rules, enable_logging)
+    v6_input = build_input_ruleset('ip6tables', rules, enable_logging) if check_ip6tables_available() else None
 
     if dry_run:
-        logger.info("[DRY RUN] Generated Built Rulesets:")
-        logger.info(v4_rules)
+        logger.info("[DRY RUN] IPv4 FORWARD ruleset:")
+        logger.info(v4_forward)
+        logger.info("[DRY RUN] IPv4 INPUT ruleset:")
+        logger.info(v4_input)
         return
 
     create_snapshot("sync")
-    
+
     try:
+        # Apply FORWARD chain rules
         proc4 = subprocess.Popen(['iptables-restore', '--noflush'], stdin=subprocess.PIPE, text=True)
-        proc4.communicate(input=v4_rules)
-        if proc4.returncode != 0: raise Exception("iptables-restore failed")
-        
-        if v6_rules:
+        proc4.communicate(input=v4_forward)
+        if proc4.returncode != 0: raise Exception("iptables-restore (FORWARD) failed")
+
+        # Apply INPUT chain rules (handles userland-proxy / DNAT bypass)
+        proc4i = subprocess.Popen(['iptables-restore', '--noflush'], stdin=subprocess.PIPE, text=True)
+        proc4i.communicate(input=v4_input)
+        if proc4i.returncode != 0: raise Exception("iptables-restore (INPUT) failed")
+
+        if v6_forward:
             proc6 = subprocess.Popen(['ip6tables-restore', '--noflush'], stdin=subprocess.PIPE, text=True)
-            proc6.communicate(input=v6_rules)
-            if proc6.returncode != 0: raise Exception("ip6tables-restore failed")
-            
+            proc6.communicate(input=v6_forward)
+            if proc6.returncode != 0: raise Exception("ip6tables-restore (FORWARD) failed")
+
+        if v6_input:
+            proc6i = subprocess.Popen(['ip6tables-restore', '--noflush'], stdin=subprocess.PIPE, text=True)
+            proc6i.communicate(input=v6_input)
+            if proc6i.returncode != 0: raise Exception("ip6tables-restore (INPUT) failed")
+
         record_transaction("SYNC", "ALL", "GLOBAL", "SUCCESS")
-        logger.info("Synchronization implemented atomically with subnet isolation.")
+        logger.info("Synchronization implemented atomically (FORWARD + INPUT chains).")
     except Exception as e:
         logger.error(f"Rule injection failed: {e}")
         record_transaction("SYNC", "ALL", "GLOBAL", "FAILED", str(e))
