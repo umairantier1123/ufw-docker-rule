@@ -176,10 +176,12 @@ def build_atomic_ruleset(iptables_cmd, config_rules, enable_logging):
     buf.append(f"-A DOCKER-USER -d {loopback} -j ACCEPT")
     
     buf.append("-A DOCKER-USER -i docker0 -j RETURN")
-    buf.append("-A DOCKER-USER -i br+ -j RETURN")
+    buf.append("-A DOCKER-USER -i docker_gwbridge -j RETURN")
+    buf.append("-A DOCKER-USER -i br-+ -j RETURN")
     
     buf.append("-A DOCKER-USER -o docker0 -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN")
-    buf.append("-A DOCKER-USER -o br+ -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN")
+    buf.append("-A DOCKER-USER -o docker_gwbridge -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN")
+    buf.append("-A DOCKER-USER -o br-+ -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN")
     
     buf.append("-A DOCKER-USER -j DOCKER-UFW-PORTS")
     
@@ -187,7 +189,8 @@ def build_atomic_ruleset(iptables_cmd, config_rules, enable_logging):
         buf.append("-A DOCKER-USER -j LOG --log-prefix \"DOCKER-BLOCK: \"")
         
     buf.append("-A DOCKER-USER -o docker0 -j DROP")
-    buf.append("-A DOCKER-USER -o br+ -j DROP")
+    buf.append("-A DOCKER-USER -o docker_gwbridge -j DROP")
+    buf.append("-A DOCKER-USER -o br-+ -j DROP")
     buf.append("-A DOCKER-USER -j RETURN")
     
     for rule in config_rules:
