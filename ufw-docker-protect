@@ -253,42 +253,58 @@ def get_docker_published_ports():
     config = load_config()
     return config.get('rules', [])
 
+def ensure_input_hook(iptables_cmd):
+    """Ensure DOCKER-UFW-INPUT is the FIRST rule in INPUT chain.
+    Removes any existing jumps (avoids duplicates) then inserts at position 1.
+    This MUST run after iptables-restore, which only manages the chain contents,
+    not the jump position within the parent INPUT chain.
+    """
+    # Remove all existing jumps to DOCKER-UFW-INPUT from INPUT
+    while True:
+        check = run_cmd([iptables_cmd, '-C', 'INPUT', '-j', 'DOCKER-UFW-INPUT'], check=False)
+        if check.returncode != 0:
+            break  # No more instances
+        run_cmd([iptables_cmd, '-D', 'INPUT', '-j', 'DOCKER-UFW-INPUT'], check=False)
+
+    # Insert at position 1 (before all UFW rules)
+    run_cmd([iptables_cmd, '-I', 'INPUT', '1', '-j', 'DOCKER-UFW-INPUT'], check=False)
+    logger.info(f"[OK] {iptables_cmd} DOCKER-UFW-INPUT inserted at INPUT position 1.")
+
 def build_input_ruleset(iptables_cmd, config_rules, enable_logging):
     """Build INPUT chain rules to block/allow Docker exposed ports.
-    This is critical because Docker's DNAT (even without userland-proxy) can route
-    traffic to the host's INPUT chain for ports bound to 0.0.0.0.
+    This blocks traffic that bypasses FORWARD via DNAT to host-bound ports.
+    NOTE: The INPUT jump hook position is managed separately by ensure_input_hook().
     """
     is_v6 = (iptables_cmd == 'ip6tables')
     buf = []
     buf.append("*filter")
     buf.append(":DOCKER-UFW-INPUT - [0:0]")
     buf.append("-F DOCKER-UFW-INPUT")
+    # NOTE: Do NOT add -A INPUT here — position is managed by ensure_input_hook()
 
-    # Hook into INPUT chain (only add once, idempotent check handled by -C test at runtime)
-    buf.append("-A INPUT -j DOCKER-UFW-INPUT")
-
-    # Allow established connections
+    # Allow established/related connections
     buf.append("-A DOCKER-UFW-INPUT -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT")
 
-    # For each explicitly allowed rule, permit inbound on that port from that source
+    # Build per-port rules: ACCEPT from allowed sources, then DROP rest
+    # Group rules by port so we can determine if a port is fully public (0.0.0.0/0)
+    port_sources = {}  # (proto, port) -> list of sources
     for rule in config_rules:
         proto, port, source = rule['protocol'], rule['port'], rule['source']
         is_ipv6_rule = ':' in source
         if is_v6 and not is_ipv6_rule and source != '0.0.0.0/0': continue
         if not is_v6 and is_ipv6_rule: continue
         actual_source = '::/0' if (is_v6 and source == '0.0.0.0/0') else source
-        buf.append(f"-A DOCKER-UFW-INPUT -p {proto} --dport {port} -s {actual_source} -j ACCEPT")
+        port_sources.setdefault((proto, port), []).append(actual_source)
 
-    # Default: drop all other inbound traffic to Docker-published ports
-    # We detect published ports from config - any port NOT in allow-list gets dropped
-    all_ports = set()
-    for rule in config_rules:
-        all_ports.add((rule['protocol'], rule['port']))
-
-    for proto, port in all_ports:
-        if enable_logging:
-            buf.append(f"-A DOCKER-UFW-INPUT -p {proto} --dport {port} -j LOG --log-prefix \"DOCKER-INPUT-BLOCK: \"")
-        buf.append(f"-A DOCKER-UFW-INPUT -p {proto} --dport {port} -j DROP")
+    for (proto, port), sources in port_sources.items():
+        is_fully_public = any(s in ('0.0.0.0/0', '::/0') for s in sources)
+        for source in sources:
+            buf.append(f"-A DOCKER-UFW-INPUT -p {proto} --dport {port} -s {source} -j ACCEPT")
+        # Only add DROP if it's NOT fully public (no point dropping after a wildcard ACCEPT)
+        if not is_fully_public:
+            if enable_logging:
+                buf.append(f"-A DOCKER-UFW-INPUT -p {proto} --dport {port} -j LOG --log-prefix \"DOCKER-INPUT-BLOCK: \"")
+            buf.append(f"-A DOCKER-UFW-INPUT -p {proto} --dport {port} -j DROP")
 
     buf.append("-A DOCKER-UFW-INPUT -j RETURN")
     buf.append("COMMIT\n")
@@ -380,10 +396,13 @@ def execute_sync(dry_run=False):
         proc4.communicate(input=v4_forward)
         if proc4.returncode != 0: raise Exception("iptables-restore (FORWARD) failed")
 
-        # Apply INPUT chain rules (handles userland-proxy / DNAT bypass)
+        # Apply INPUT chain rules (chain contents only, no jump here)
         proc4i = subprocess.Popen(['iptables-restore', '--noflush'], stdin=subprocess.PIPE, text=True)
         proc4i.communicate(input=v4_input)
         if proc4i.returncode != 0: raise Exception("iptables-restore (INPUT) failed")
+
+        # CRITICAL: Insert the jump at INPUT position 1 BEFORE UFW rules
+        ensure_input_hook('iptables')
 
         if v6_forward:
             proc6 = subprocess.Popen(['ip6tables-restore', '--noflush'], stdin=subprocess.PIPE, text=True)
@@ -394,6 +413,7 @@ def execute_sync(dry_run=False):
             proc6i = subprocess.Popen(['ip6tables-restore', '--noflush'], stdin=subprocess.PIPE, text=True)
             proc6i.communicate(input=v6_input)
             if proc6i.returncode != 0: raise Exception("ip6tables-restore (INPUT) failed")
+            ensure_input_hook('ip6tables')
 
         record_transaction("SYNC", "ALL", "GLOBAL", "SUCCESS")
         logger.info("Synchronization implemented atomically (FORWARD + INPUT chains).")
